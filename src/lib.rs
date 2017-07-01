@@ -1,5 +1,7 @@
+#![allow(dead_code, non_camel_case_types, non_upper_case_globals, unused_variables)]
 #[macro_use]
 extern crate error_chain;
+extern crate hex;
 #[macro_use]
 extern crate log;
 extern crate mach_o_sys;
@@ -9,13 +11,15 @@ extern crate nom;
 
 mod errors;
 
+use hex::ToHex;
 use macho::{LcType, MachObject};
 use nom::{be_u8, be_u32, IResult};
 use std::boxed::Box;
+use std::fmt;
 use std::fs::File;
 use std::mem;
 use std::path::Path;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::str;
 
 pub use errors::*;
@@ -50,8 +54,9 @@ pub fn dump_signature<P>(path: P) -> Result<()>
         print_superblob(&super_, 0);
         for (type_, blob) in super_.blobs {
             if type_ == cdSignatureSlot {
-                if let Blob::BlobWrapper { data } = blob {
-                    //File::create("/tmp/signature")?.write_all(data)?;
+                if let Blob::BlobWrapper(WrappedData { data }) = blob {
+                    use std::io::Write;
+                    File::create("/tmp/signature")?.write_all(data)?;
                 } else {
                     bail!("Bad blob in signature slot!");
                 }
@@ -78,12 +83,16 @@ fn print_superblob(sb: &SuperBlob, indent: usize) {
     }
 }
 
-struct Requirement {}
-struct Entitlements {}
-
-#[derive(Debug)]
 struct Hash<'a> {
     bytes: &'a [u8],
+}
+
+impl<'a> fmt::Debug for Hash<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Hash {{ ")?;
+        self.bytes.write_hex(f)?;
+        write!(f, " }}")
+    }
 }
 
 enum SecCSDigestAlgorithm {
@@ -114,13 +123,23 @@ struct CodeDirectory<'a> {
     hashes: Vec<Hash<'a>>,
 }
 
+struct WrappedData<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> fmt::Debug for WrappedData<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "...")
+    }
+}
+
 #[derive(Debug)]
 enum Blob<'a> {
     Requirement { kind: u32, expr: Expr<'a> },
     Entitlements { super_: SuperBlob<'a> },
     CodeDirectory(CodeDirectory<'a>),
     Entitlement { plist: &'a str },
-    BlobWrapper { data: &'a [u8] },
+    BlobWrapper(WrappedData<'a>),
     EmbeddedSignature { super_: SuperBlob<'a> },
     DetachedSignature,
 }
@@ -415,7 +434,7 @@ named!(blob_wrapper<&[u8], Blob>,
            tag!(&[ 0xfa, 0xde, 0x0b, 0x01 ][..]) >>
                length: be_u32 >>
                data: take!(length - 8) >>
-               (Blob::BlobWrapper { data: data })
+               (Blob::BlobWrapper(WrappedData { data: data }))
            )
        );
 
