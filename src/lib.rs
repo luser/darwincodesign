@@ -6,81 +6,124 @@ extern crate hex;
 extern crate log;
 extern crate mach_o_sys;
 extern crate macho;
+extern crate memmap;
 #[macro_use]
 extern crate nom;
+extern crate ring;
 
 mod errors;
 
 use hex::ToHex;
 use macho::{LcType, MachObject};
-use nom::{be_u8, be_u32, IResult};
+use memmap::{Mmap, Protection};
+use nom::{be_u8, be_u32, le_u32, IResult};
+use ring::digest::{self, Digest, SHA1};
 use std::boxed::Box;
 use std::fmt;
+use std::io::Write;
 use std::fs::File;
-use std::mem;
 use std::path::Path;
-use std::io::{BufReader, Read};
 use std::str;
 
 pub use errors::*;
 
-#[allow(non_camel_case_types)]
-struct linkedit_data_command_bits {
-    pub dataoff: u32,
-    pub datasize: u32,
+pub enum SignatureValidity {
+    Valid,
+    Invalid,
 }
 
+fn do_hash(bytes: &[u8], hash_type: SecCSDigestAlgorithm) -> Digest {
+    match hash_type {
+        SecCSDigestAlgorithm::kSecCodeSignatureHashSHA1 => {
+            digest::digest(&SHA1, bytes)
+        }
+        _ => unimplemented!(),
+    }
+}
+
+fn code_hashes(data: &[u8], hash_type: SecCSDigestAlgorithm, page_size: u32, code_limit: u32) -> Vec<Digest> {
+    let bytes = &data[..code_limit as usize];
+    bytes.chunks(page_size as usize)
+        .map(|c| {
+            do_hash(c, hash_type)
+        })
+        .collect()
+}
+
+pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
+     where P: AsRef<Path>,
+{
+    with_signature(path, |sig, data| {
+        if let Some(cd) = sig.code_directory() {
+            //TODO: calculate hashes for special slots
+            let calc_hashes = code_hashes(data, cd.hash_type, cd.page_size, cd.code_limit);
+            let (_special_hashes, code_hashes) = cd.hashes.split_at(cd.special_slots as usize);
+            let eq = code_hashes.iter().zip(calc_hashes).all(|(h, o)| *h == o);
+            if eq {
+                Ok(SignatureValidity::Valid)
+            } else {
+                Ok(SignatureValidity::Invalid)
+            }
+        } else {
+            bail!("Missing CodeDirectory")
+        }
+    })
+}
+
+fn get_signature<'a, 'b>(macho: &MachObject<'a>, data: &'b [u8]) -> Result<EmbeddedSignature<'b>>
+{
+    // Locate the LC_CODE_SIGNATURE
+    let codesig = match macho.commands.iter().filter(|c| c.cmd == LcType::LC_CODE_SIGNATURE as u32).next() {
+        None => bail!("Missing LC_CODE_SIGNATURE load command"),
+        Some(c) => c,
+    };
+    let datacmd = parse_linkedit_command(codesig.data)?;
+    // Get the actual bytes of the signature blob from the linkedit segment
+    let codesig_data = &data[datacmd.dataoff as usize..(datacmd.dataoff + datacmd.datasize) as usize];
+    let codesig_blob = parse_blob(codesig_data)?;
+    if let Blob::EmbeddedSignature(sig) = codesig_blob {
+        Ok(sig)
+    } else {
+        bail!(ErrorKind::IncorrectBlobType)
+    }
+}
+
+fn with_signature<P, F, T>(path: P, callback: F) -> Result<T>
+    where P: AsRef<Path>,
+          for<'a> F: FnOnce(EmbeddedSignature<'a>, &'a [u8]) -> Result<T>,
+{
+    let data = Mmap::open_path(path, Protection::Read)?;
+    let buf = unsafe { data.as_slice() };
+    let m = MachObject::parse(buf)?;
+    let sig = get_signature(&m, buf)?;
+    callback(sig, buf)
+}
+
+/// Print information about the embedded code signature of `path` to stdout.
 pub fn dump_signature<P>(path: P) -> Result<()>
     where P: AsRef<Path>,
 
 {
-    let path = path.as_ref();
-    trace!("dump_signature: {:?}", path);
-    let mut buf = vec!();
-    {
-        let mut r = BufReader::new(File::open(path)?);
-        r.read_to_end(&mut buf)?;
-    }
-    let m = MachObject::parse(&buf)?;
-    let codesig = match m.commands.iter().filter(|c| c.cmd == LcType::LC_CODE_SIGNATURE as u32).next() {
-        None => bail!("Missing LC_CODE_SIGNATURE load command"),
-        Some(c) => c,
-    };
-    let datacmd: &linkedit_data_command_bits = unsafe { mem::transmute(codesig.data.as_ptr()) };
-    let codesig_data = &buf[datacmd.dataoff as usize..(datacmd.dataoff + datacmd.datasize) as usize];
-    trace!("codesign_data: {:?}, {} bytes", codesig_data.as_ptr(), codesig_data.len());
-    let codesig_blob = parse_blob(codesig_data)?;
-    if let Blob::EmbeddedSignature { super_ } = codesig_blob {
-        print_superblob(&super_, 0);
-        for (type_, blob) in super_.blobs {
-            if type_ == cdSignatureSlot {
-                if let Blob::BlobWrapper(WrappedData { data }) = blob {
-                    use std::io::Write;
-                    File::create("/tmp/signature")?.write_all(data)?;
-                } else {
-                    bail!("Bad blob in signature slot!");
-                }
-            }
-        }
-    } else {
-        bail!("Invalid code signature blob");
-    }
-
-    Ok(())
+    with_signature(path, |sig, _| {
+        println!("{:?}", sig);
+        Ok(())
+    })
 }
 
-fn print_superblob(sb: &SuperBlob, indent: usize) {
-    trace!("print_superblob");
-    for &(type_, ref blob) in sb.blobs.iter() {
-        print!("{:indent$}: ", type_, indent=indent*8);
-        match blob {
-            &Blob::Entitlements { ref super_ } => {
-                println!("Entitlements:");
-                print_superblob(super_, indent + 1);
-            }
-            b @ _ => println!("blob: {:?}", b),
-        }
-    }
+/// Extract the embedded code signature of `input_path` and write it to `output_path`.
+pub fn extract_signature<P, Q>(input_path: P, output_path: Q) -> Result<()>
+    where P: AsRef<Path>,
+          Q: AsRef<Path>,
+{
+    with_signature(input_path, |sig, _| {
+        let pkcs7 = match sig.pkcs7_signature() {
+            None => bail!("PKCS#7 signature not found"),
+            Some(s) => s,
+        };
+        let mut f = File::create(output_path)?;
+        f.write_all(pkcs7)?;
+        Ok(())
+    })
 }
 
 struct Hash<'a> {
@@ -95,19 +138,53 @@ impl<'a> fmt::Debug for Hash<'a> {
     }
 }
 
-enum SecCSDigestAlgorithm {
+impl<'a, T> PartialEq<T> for Hash<'a>
+    where T: AsRef<[u8]>,
+{
+    fn eq(&self, other: &T) -> bool {
+        self.bytes == other.as_ref()
+    }
+}
+
+macro_rules! enum_tryfrom {
+    ($name:ident : $t:ty { $( $e:ident = $v:expr, )* }) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug)]
+        enum $name {
+            $( $e = $v, )*
+        }
+
+        impl $name {
+            pub fn try_from(val: $t) -> Option<$name> {
+                $(
+                    if val == $v as $t {
+                        return Some($name::$e);
+                    }
+                )*
+                return None
+            }
+        }
+    }
+}
+
+enum_tryfrom!(SecCSDigestAlgorithm: u8 {
     kSecCodeSignatureNoHash = 0,
     kSecCodeSignatureHashSHA1 = 1,
     kSecCodeSignatureHashSHA256 = 2,
-    // truncated to 20 bytes
     kSecCodeSignatureHashSHA256Truncated = 3,
     kSecCodeSignatureHashSHA384	= 4,
-}
+});
 
-const cdSignatureSlot: u32 = 0x10000;
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum SuperBlobSlot {
+    CodeDirectory = 0,
+    Signature = 0x10000,
+}
 
 #[derive(Debug)]
 struct CodeDirectory<'a> {
+    cdhash: Digest,
     version: u32,
     flags: u32,
     hash_offset: u32,
@@ -116,8 +193,8 @@ struct CodeDirectory<'a> {
     code_slots: u32,
     code_limit: u32,
     hash_size: u8,
-    hash_type: u8,
-    page_size: u8,
+    hash_type: SecCSDigestAlgorithm,
+    page_size: u32,
     scatter_offset: Option<u32>,
     ident: &'a str,
     hashes: Vec<Hash<'a>>,
@@ -133,6 +210,38 @@ impl<'a> fmt::Debug for WrappedData<'a> {
     }
 }
 
+struct EmbeddedSignature<'a> {
+    super_: SuperBlob<'a>,
+}
+
+impl<'a> EmbeddedSignature<'a> {
+    /// Get the PKCS#7 signature, if present.
+    pub fn pkcs7_signature(&'a self) -> Option<&'a [u8]> {
+        match self.super_.get_blob(SuperBlobSlot::Signature) {
+            Some(&Blob::BlobWrapper(WrappedData { data })) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Get the embedded `CodeDirectory`, if present.
+    pub fn code_directory(&'a self) -> Option<&'a CodeDirectory<'a>> {
+        match self.super_.get_blob(SuperBlobSlot::CodeDirectory) {
+            Some(&Blob::CodeDirectory(ref cd)) => Some(cd),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> fmt::Debug for EmbeddedSignature<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "EmbeddedSignature {{")?;
+        for &(type_, ref blob) in self.super_.blobs.iter() {
+            writeln!(f, "\t{}: {:?}", type_, blob)?;
+        }
+        writeln!(f, "}}")
+    }
+}
+
 #[derive(Debug)]
 enum Blob<'a> {
     Requirement { kind: u32, expr: Expr<'a> },
@@ -140,7 +249,7 @@ enum Blob<'a> {
     CodeDirectory(CodeDirectory<'a>),
     Entitlement { plist: &'a str },
     BlobWrapper(WrappedData<'a>),
-    EmbeddedSignature { super_: SuperBlob<'a> },
+    EmbeddedSignature(EmbeddedSignature<'a>),
     DetachedSignature,
 }
 
@@ -148,6 +257,33 @@ enum Blob<'a> {
 struct SuperBlob<'a> {
     blobs: Vec<(u32, Blob<'a>)>,
 }
+
+impl<'a> SuperBlob<'a> {
+    pub fn get_blob(&self, slot: SuperBlobSlot) -> Option<&'a Blob> {
+        for &(type_, ref blob) in self.blobs.iter() {
+            if type_ == slot as u32 {
+                return Some(blob);
+            }
+        }
+        None
+    }
+}
+
+struct LinkeditCommand {
+    pub dataoff: u32,
+    pub datasize: u32,
+}
+
+named!(linkedit_command<&[u8], LinkeditCommand>,
+       do_parse!(
+           dataoff: le_u32 >>
+               datasize: le_u32 >>
+               (LinkeditCommand {
+                   dataoff: dataoff,
+                   datasize: datasize,
+               })
+               )
+       );
 
 named!(blob_index<&[u8], (u32, u32)>,
        do_parse!(
@@ -403,6 +539,7 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
               be_u32 >>
               scatter_offset: cond!(version > 0x20100, be_u32) >>
               (Blob::CodeDirectory(CodeDirectory {
+                  cdhash: digest::digest(&SHA1, &input[..length as usize]),
                   version: version,
                   flags: flags,
                   hash_offset: hash_offset,
@@ -411,8 +548,8 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
                   code_slots: code_slots,
                   code_limit: code_limit,
                   hash_size: hash_size,
-                  hash_type: hash_type,
-                  page_size: page_size,
+                  hash_type: SecCSDigestAlgorithm::try_from(hash_type).unwrap(),
+                  page_size: 2u32.pow(page_size as u32),
                   scatter_offset: scatter_offset,
                   ident: cstr(input, ident_offset as usize).unwrap(),
                   hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size),
@@ -443,7 +580,7 @@ fn embedded_signature(input: &[u8]) -> IResult<&[u8], Blob> {
               tag!(&[ 0xfa, 0xde, 0x0c, 0xc0 ][..]) >>
               length: be_u32 >>
               super_: super_blob!(input) >>
-              (Blob::EmbeddedSignature { super_: super_ })
+              (Blob::EmbeddedSignature(EmbeddedSignature { super_: super_ }))
               )
 }
 
@@ -463,6 +600,15 @@ fn parse_blob(data: &[u8]) -> Result<Blob> {
     trace!("parse_blob {:?}, {} bytes", data.as_ptr(), data.len());
     match blob(data) {
         IResult::Done(_rest, blob) => Ok(blob),
+        IResult::Incomplete(_) => bail!(ErrorKind::Incomplete),
+        IResult::Error(e) => bail!(e),
+    }
+}
+
+fn parse_linkedit_command(data: &[u8]) -> Result<LinkeditCommand> {
+    trace!("parse_linkedit_command {:?}, {} bytes", data.as_ptr(), data.len());
+    match linkedit_command(data) {
+        IResult::Done(_rest, cmd) => Ok(cmd),
         IResult::Incomplete(_) => bail!(ErrorKind::Incomplete),
         IResult::Error(e) => bail!(e),
     }

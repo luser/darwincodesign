@@ -1,6 +1,7 @@
 error_chain! {
     foreign_links {
         Io(::std::io::Error);
+        //Mmap(::mmap::MapError);
         Nom(::nom::Err);
         Utf8(::std::str::Utf8Error);
     }
@@ -8,6 +9,7 @@ error_chain! {
     errors {
         Null
         Incomplete
+        IncorrectBlobType
     }
 }
 
