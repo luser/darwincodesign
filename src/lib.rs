@@ -17,7 +17,7 @@ use hex::ToHex;
 use macho::{LcType, MachObject};
 use memmap::{Mmap, Protection};
 use nom::{be_u8, be_u32, le_u32, IResult};
-use ring::digest::{self, Digest, SHA1};
+use ring::digest::{self, Digest, SHA1, SHA256};
 use std::boxed::Box;
 use std::fmt;
 use std::io::Write;
@@ -34,9 +34,8 @@ pub enum SignatureValidity {
 
 fn do_hash(bytes: &[u8], hash_type: SecCSDigestAlgorithm) -> Digest {
     match hash_type {
-        SecCSDigestAlgorithm::kSecCodeSignatureHashSHA1 => {
-            digest::digest(&SHA1, bytes)
-        }
+        SecCSDigestAlgorithm::kSecCodeSignatureHashSHA1 =>  digest::digest(&SHA1, bytes),
+        SecCSDigestAlgorithm::kSecCodeSignatureHashSHA256 =>  digest::digest(&SHA256, bytes),
         _ => unimplemented!(),
     }
 }
@@ -155,13 +154,13 @@ macro_rules! enum_tryfrom {
         }
 
         impl $name {
-            pub fn try_from(val: $t) -> Option<$name> {
+            pub fn try_from(val: $t) -> Result<$name> {
                 $(
                     if val == $v as $t {
-                        return Some($name::$e);
+                        return Ok($name::$e);
                     }
                 )*
-                return None
+                bail!("Invalid enum value");
             }
         }
     }
@@ -531,7 +530,7 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
               code_slots: be_u32 >>
               code_limit: be_u32 >>
               hash_size: be_u8 >>
-              hash_type: be_u8 >>
+              hash_type: map_res!(be_u8, SecCSDigestAlgorithm::try_from) >>
               // spare1
               be_u8 >>
               page_size: be_u8 >>
@@ -539,7 +538,7 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
               be_u32 >>
               scatter_offset: cond!(version > 0x20100, be_u32) >>
               (Blob::CodeDirectory(CodeDirectory {
-                  cdhash: digest::digest(&SHA1, &input[..length as usize]),
+                  cdhash: do_hash(&input[..length as usize], hash_type),
                   version: version,
                   flags: flags,
                   hash_offset: hash_offset,
@@ -548,7 +547,7 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
                   code_slots: code_slots,
                   code_limit: code_limit,
                   hash_size: hash_size,
-                  hash_type: SecCSDigestAlgorithm::try_from(hash_type).unwrap(),
+                  hash_type: hash_type,
                   page_size: 2u32.pow(page_size as u32),
                   scatter_offset: scatter_offset,
                   ident: cstr(input, ident_offset as usize).unwrap(),
