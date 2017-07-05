@@ -32,6 +32,34 @@ pub enum SignatureValidity {
     Invalid,
 }
 
+/// Hash slots for non-code entries.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+pub enum Slot {
+    /// The `CodeDirectory`
+    CodeDirectory = 0,
+    /// Info.plist
+    /// Values from here to `Signature` are used as *negative* indices into
+    /// the `CodeDirectory` hashes array.
+    Info = 1,
+    /// Internal requirements
+    Requirements = 2,
+    /// Resource directory
+    ResourceDir = 3,
+    /// Application specific slot
+    TopDirectory = 4,
+    /// Embedded entitlement configuration
+    Entitlement = 5,
+    /// For use by disk rep.
+    RepSpecific = 6,
+    /// Start of alternate `CodeDirectory` entries.
+    AlternateCodeDirectoryStart = 0x1000,
+    /// Maximum value for alternate `CodeDirectory` entries.
+    MaxAlternateCodeDirectory = 0x1005,
+    /// CMS signature.
+    Signature = 0x10000,
+}
+
 fn do_hash(bytes: &[u8], hash_type: SecCSDigestAlgorithm) -> Digest {
     match hash_type {
         SecCSDigestAlgorithm::kSecCodeSignatureHashSHA1 =>  digest::digest(&SHA1, bytes),
@@ -56,8 +84,7 @@ pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
         if let Some(cd) = sig.code_directory() {
             //TODO: calculate hashes for special slots
             let calc_hashes = code_hashes(data, cd.hash_type, cd.page_size, cd.code_limit);
-            let (_special_hashes, code_hashes) = cd.hashes.split_at(cd.special_slots as usize);
-            let eq = code_hashes.iter().zip(calc_hashes).all(|(h, o)| *h == o);
+            let eq = cd.code_hashes.iter().zip(calc_hashes).all(|(h, o)| *h == o);
             if eq {
                 Ok(SignatureValidity::Valid)
             } else {
@@ -104,7 +131,7 @@ pub fn dump_signature<P>(path: P) -> Result<()>
 
 {
     with_signature(path, |sig, _| {
-        println!("{:?}", sig);
+        println!("{:#?}", sig);
         Ok(())
     })
 }
@@ -174,13 +201,6 @@ enum_tryfrom!(SecCSDigestAlgorithm: u8 {
     kSecCodeSignatureHashSHA384	= 4,
 });
 
-#[repr(u32)]
-#[derive(Clone, Copy)]
-enum SuperBlobSlot {
-    CodeDirectory = 0,
-    Signature = 0x10000,
-}
-
 #[derive(Debug)]
 struct CodeDirectory<'a> {
     cdhash: Digest,
@@ -196,7 +216,13 @@ struct CodeDirectory<'a> {
     page_size: u32,
     scatter_offset: Option<u32>,
     ident: &'a str,
-    hashes: Vec<Hash<'a>>,
+    special_hashes: Vec<Hash<'a>>,
+    code_hashes: Vec<Hash<'a>>,
+}
+
+enum Hashes {
+    Code,
+    Special,
 }
 
 struct WrappedData<'a> {
@@ -216,7 +242,7 @@ struct EmbeddedSignature<'a> {
 impl<'a> EmbeddedSignature<'a> {
     /// Get the PKCS#7 signature, if present.
     pub fn pkcs7_signature(&'a self) -> Option<&'a [u8]> {
-        match self.super_.get_blob(SuperBlobSlot::Signature) {
+        match self.super_.get_blob(Slot::Signature) {
             Some(&Blob::BlobWrapper(WrappedData { data })) => Some(data),
             _ => None,
         }
@@ -224,8 +250,16 @@ impl<'a> EmbeddedSignature<'a> {
 
     /// Get the embedded `CodeDirectory`, if present.
     pub fn code_directory(&'a self) -> Option<&'a CodeDirectory<'a>> {
-        match self.super_.get_blob(SuperBlobSlot::CodeDirectory) {
+        match self.super_.get_blob(Slot::CodeDirectory) {
             Some(&Blob::CodeDirectory(ref cd)) => Some(cd),
+            _ => None,
+        }
+    }
+
+    /// Get the embedded `Entitlements` representing the requirements, if present.
+    pub fn requirements(&'a self) -> Option<&'a Entitlements<'a>> {
+        match self.super_.get_blob(Slot::Requirements) {
+            Some(&Blob::Entitlements(ref e)) => Some(e),
             _ => None,
         }
     }
@@ -233,18 +267,19 @@ impl<'a> EmbeddedSignature<'a> {
 
 impl<'a> fmt::Debug for EmbeddedSignature<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "EmbeddedSignature {{")?;
-        for &(type_, ref blob) in self.super_.blobs.iter() {
-            writeln!(f, "\t{}: {:?}", type_, blob)?;
+        write!(f, "EmbeddedSignature ")?;
+        if f.alternate() {
+            write!(f, "{:#?}", self.super_)
+        } else {
+            write!(f, "{:?}", self.super_)
         }
-        writeln!(f, "}}")
     }
 }
 
 #[derive(Debug)]
 enum Blob<'a> {
     Requirement { kind: u32, expr: Expr<'a> },
-    Entitlements { super_: SuperBlob<'a> },
+    Entitlements(Entitlements<'a>),
     CodeDirectory(CodeDirectory<'a>),
     Entitlement { plist: &'a str },
     BlobWrapper(WrappedData<'a>),
@@ -252,19 +287,40 @@ enum Blob<'a> {
     DetachedSignature,
 }
 
-#[derive(Debug)]
 struct SuperBlob<'a> {
     blobs: Vec<(u32, Blob<'a>)>,
 }
 
+struct Entitlements<'a> {
+    super_: SuperBlob<'a>,
+    bytes: &'a [u8]
+}
+
+impl<'a> fmt::Debug for Entitlements<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "EmbeddedSignature ")?;
+        if f.alternate() {
+            write!(f, "{:#?}", self.super_)
+        } else {
+            write!(f, "{:?}", self.super_)
+        }
+    }
+}
+
 impl<'a> SuperBlob<'a> {
-    pub fn get_blob(&self, slot: SuperBlobSlot) -> Option<&'a Blob> {
+    pub fn get_blob(&self, slot: Slot) -> Option<&'a Blob> {
         for &(type_, ref blob) in self.blobs.iter() {
             if type_ == slot as u32 {
                 return Some(blob);
             }
         }
         None
+    }
+}
+
+impl<'a> fmt::Debug for SuperBlob<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_map().entries(self.blobs.iter().map(|&(type_, ref blob)| (type_, blob))).finish()
     }
 }
 
@@ -499,7 +555,10 @@ fn entitlements(input: &[u8]) -> IResult<&[u8], Blob> {
               tag!(&[ 0xfa, 0xde, 0x0c, 0x01 ][..]) >>
               length: be_u32 >>
               super_: super_blob!(input) >>
-              (Blob::Entitlements { super_: super_ })
+              (Blob::Entitlements(Entitlements {
+                  super_: super_,
+                  bytes: input,
+              }))
               )
 }
 
@@ -510,9 +569,12 @@ fn cstr(data: &[u8], offset: usize)  -> Result<&str> {
     }
 }
 
-fn get_hashes(input: &[u8], hash_offset: u32, special_slots: u32, code_slots: u32, hash_size: u8) -> Vec<Hash> {
-    let real_offset = (hash_offset - hash_size as u32 * special_slots) as usize;
-    input[real_offset..real_offset + ((special_slots + code_slots) * hash_size as u32) as usize]
+fn get_hashes(input: &[u8], hash_offset: u32, special_slots: u32, code_slots: u32, hash_size: u8, hash_type: Hashes) -> Vec<Hash> {
+    let (offset, count) = match hash_type {
+        Hashes::Code => (hash_offset as usize, code_slots as usize),
+        Hashes::Special => ((hash_offset - (hash_size as u32 * special_slots)) as usize, special_slots as usize),
+    };
+    input[offset..offset + (count * hash_size as usize) as usize]
         .chunks(hash_size as usize)
         .map(|bytes| Hash { bytes: bytes })
         .collect()
@@ -551,7 +613,8 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
                   page_size: 2u32.pow(page_size as u32),
                   scatter_offset: scatter_offset,
                   ident: cstr(input, ident_offset as usize).unwrap(),
-                  hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size),
+                  special_hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size, Hashes::Special),
+                  code_hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size, Hashes::Code),
               }))
               )
 }
