@@ -19,6 +19,7 @@ use memmap::{Mmap, Protection};
 use nom::{be_u8, be_u32, le_u32, IResult};
 use ring::digest::{self, Digest, SHA1, SHA256};
 use std::boxed::Box;
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::fs::File;
@@ -32,33 +33,60 @@ pub enum SignatureValidity {
     Invalid,
 }
 
-/// Hash slots for non-code entries.
-#[repr(u32)]
-#[derive(Clone, Copy)]
-pub enum Slot {
-    /// The `CodeDirectory`
-    CodeDirectory = 0,
-    /// Info.plist
-    /// Values from here to `Signature` are used as *negative* indices into
-    /// the `CodeDirectory` hashes array.
-    Info = 1,
-    /// Internal requirements
-    Requirements = 2,
-    /// Resource directory
-    ResourceDir = 3,
-    /// Application specific slot
-    TopDirectory = 4,
-    /// Embedded entitlement configuration
-    Entitlement = 5,
-    /// For use by disk rep.
-    RepSpecific = 6,
-    /// Start of alternate `CodeDirectory` entries.
-    AlternateCodeDirectoryStart = 0x1000,
-    /// Maximum value for alternate `CodeDirectory` entries.
-    MaxAlternateCodeDirectory = 0x1005,
-    /// CMS signature.
-    Signature = 0x10000,
+macro_rules! enum_tryfrom {
+    ($name:ident : $t:ty { $( $e:ident = $v:expr, )+ }) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+        enum $name {
+            $( $e = $v, )+
+        }
+
+        impl $name {
+            pub fn try_from(val: $t) -> Result<$name> {
+                $(
+                    if val == $v as $t {
+                        return Ok($name::$e);
+                    }
+                )*
+                bail!("Invalid enum value");
+            }
+        }
+    }
 }
+
+/// Hash algorithms used for code signatures.
+enum_tryfrom!(SecCSDigestAlgorithm: u8 {
+    kSecCodeSignatureNoHash = 0,
+    kSecCodeSignatureHashSHA1 = 1,
+    kSecCodeSignatureHashSHA256 = 2,
+    kSecCodeSignatureHashSHA256Truncated = 3,
+    kSecCodeSignatureHashSHA384	= 4,
+});
+
+/// Hash slots for non-code entries.
+enum_tryfrom!(Slot: u32 {
+    // The `CodeDirectory`
+    CodeDirectory = 0,
+    // Info.plist
+    // Values from here to `Signature` are used as *negative* indices into
+    // the `CodeDirectory` hashes array.
+    Info = 1,
+    // Internal requirements
+    Requirements = 2,
+    // Resource directory
+    ResourceDir = 3,
+    // Application specific slot
+    TopDirectory = 4,
+    // Embedded entitlement configuration
+    Entitlement = 5,
+    // For use by disk rep.
+    RepSpecific = 6,
+    // Start of alternate `CodeDirectory` entries.
+    AlternateCodeDirectoryStart = 0x1000,
+    // Maximum value for alternate `CodeDirectory` entries.
+    MaxAlternateCodeDirectory = 0x1005,
+    // CMS signature.
+    Signature = 0x10000,
+});
 
 fn do_hash(bytes: &[u8], hash_type: SecCSDigestAlgorithm) -> Digest {
     match hash_type {
@@ -82,13 +110,22 @@ pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
 {
     with_signature(path, |sig, data| {
         if let Some(cd) = sig.code_directory() {
-            //TODO: calculate hashes for special slots
-            match sig.requirements() {
+            //TODO: calculate hashes for all special slots
+            for (&slot, hash) in cd.special_hashes.iter() {
+                match slot {
+                    Slot::Requirements =>
+                match sig.requirements() {
                 Some(r) => {
-                    println!("Requirements hash: {:?}", do_hash(r.bytes, cd.hash_type));
+                    let calc_hash = do_hash(r.bytes, cd.hash_type);
+                    if *hash != calc_hash {
+                        return Ok(SignatureValidity::Invalid);
+                    }
                 }
                 None => {
-                    println!("No requirements?");
+                    return Ok(SignatureValidity::Invalid);
+                }
+            },
+            _ => {} // TODO
                 }
             }
             let calc_hashes = code_hashes(data, cd.hash_type, cd.page_size, cd.code_limit);
@@ -180,35 +217,6 @@ impl<'a, T> PartialEq<T> for Hash<'a>
     }
 }
 
-macro_rules! enum_tryfrom {
-    ($name:ident : $t:ty { $( $e:ident = $v:expr, )* }) => {
-        #[repr(u8)]
-        #[derive(Clone, Copy, Debug)]
-        enum $name {
-            $( $e = $v, )*
-        }
-
-        impl $name {
-            pub fn try_from(val: $t) -> Result<$name> {
-                $(
-                    if val == $v as $t {
-                        return Ok($name::$e);
-                    }
-                )*
-                bail!("Invalid enum value");
-            }
-        }
-    }
-}
-
-enum_tryfrom!(SecCSDigestAlgorithm: u8 {
-    kSecCodeSignatureNoHash = 0,
-    kSecCodeSignatureHashSHA1 = 1,
-    kSecCodeSignatureHashSHA256 = 2,
-    kSecCodeSignatureHashSHA256Truncated = 3,
-    kSecCodeSignatureHashSHA384	= 4,
-});
-
 #[derive(Debug)]
 struct CodeDirectory<'a> {
     cdhash: Digest,
@@ -224,7 +232,7 @@ struct CodeDirectory<'a> {
     page_size: u32,
     scatter_offset: Option<u32>,
     ident: &'a str,
-    special_hashes: Vec<Hash<'a>>,
+    special_hashes: HashMap<Slot, Hash<'a>>,
     code_hashes: Vec<Hash<'a>>,
 }
 
@@ -306,7 +314,8 @@ struct Requirements<'a> {
 
 impl<'a> fmt::Debug for Requirements<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Requirements ")?;
+        //FIXME: don't hardcode sha-1 here!
+        write!(f, "Requirements (hash={:?}) ", do_hash(self.bytes, SecCSDigestAlgorithm::kSecCodeSignatureHashSHA1))?;
         if f.alternate() {
             write!(f, "{:#?}", self.super_)
         } else {
@@ -565,7 +574,7 @@ fn requirements(input: &[u8]) -> IResult<&[u8], Blob> {
               super_: super_blob!(input) >>
               (Blob::Requirements(Requirements {
                   super_: super_,
-                  bytes: input,
+                  bytes: &input[..length as usize],
               }))
               )
 }
@@ -586,6 +595,10 @@ fn get_hashes(input: &[u8], hash_offset: u32, special_slots: u32, code_slots: u3
         .chunks(hash_size as usize)
         .map(|bytes| Hash { bytes: bytes })
         .collect()
+}
+
+fn make_special_hashes<'a>(hashes: Vec<Hash<'a>>) -> HashMap<Slot, Hash<'a>> {
+    hashes.into_iter().enumerate().map(|(i, h)| (Slot::try_from(i as u32).expect("Bad special slot index!"), h)).collect()
 }
 
 fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
@@ -621,7 +634,7 @@ fn code_directory(input:&[u8]) -> IResult<&[u8], Blob> {
                   page_size: 2u32.pow(page_size as u32),
                   scatter_offset: scatter_offset,
                   ident: cstr(input, ident_offset as usize).unwrap(),
-                  special_hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size, Hashes::Special),
+                  special_hashes: make_special_hashes(get_hashes(input, hash_offset, special_slots, code_slots, hash_size, Hashes::Special)),
                   code_hashes: get_hashes(input, hash_offset, special_slots, code_slots, hash_size, Hashes::Code),
               }))
               )
