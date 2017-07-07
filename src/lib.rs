@@ -83,6 +83,14 @@ pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
     with_signature(path, |sig, data| {
         if let Some(cd) = sig.code_directory() {
             //TODO: calculate hashes for special slots
+            match sig.requirements() {
+                Some(r) => {
+                    println!("Requirements hash: {:?}", do_hash(r.bytes, cd.hash_type));
+                }
+                None => {
+                    println!("No requirements?");
+                }
+            }
             let calc_hashes = code_hashes(data, cd.hash_type, cd.page_size, cd.code_limit);
             let eq = cd.code_hashes.iter().zip(calc_hashes).all(|(h, o)| *h == o);
             if eq {
@@ -256,10 +264,10 @@ impl<'a> EmbeddedSignature<'a> {
         }
     }
 
-    /// Get the embedded `Entitlements` representing the requirements, if present.
-    pub fn requirements(&'a self) -> Option<&'a Entitlements<'a>> {
+    /// Get the embedded `Requirements` representing the requirements, if present.
+    pub fn requirements(&'a self) -> Option<&'a Requirements<'a>> {
         match self.super_.get_blob(Slot::Requirements) {
-            Some(&Blob::Entitlements(ref e)) => Some(e),
+            Some(&Blob::Requirements(ref r)) => Some(r),
             _ => None,
         }
     }
@@ -279,7 +287,7 @@ impl<'a> fmt::Debug for EmbeddedSignature<'a> {
 #[derive(Debug)]
 enum Blob<'a> {
     Requirement { kind: u32, expr: Expr<'a> },
-    Entitlements(Entitlements<'a>),
+    Requirements(Requirements<'a>),
     CodeDirectory(CodeDirectory<'a>),
     Entitlement { plist: &'a str },
     BlobWrapper(WrappedData<'a>),
@@ -291,14 +299,14 @@ struct SuperBlob<'a> {
     blobs: Vec<(u32, Blob<'a>)>,
 }
 
-struct Entitlements<'a> {
+struct Requirements<'a> {
     super_: SuperBlob<'a>,
     bytes: &'a [u8]
 }
 
-impl<'a> fmt::Debug for Entitlements<'a> {
+impl<'a> fmt::Debug for Requirements<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "EmbeddedSignature ")?;
+        write!(f, "Requirements ")?;
         if f.alternate() {
             write!(f, "{:#?}", self.super_)
         } else {
@@ -550,12 +558,12 @@ named!(requirement<&[u8], Blob>,
            )
        );
 
-fn entitlements(input: &[u8]) -> IResult<&[u8], Blob> {
+fn requirements(input: &[u8]) -> IResult<&[u8], Blob> {
     do_parse!(input,
               tag!(&[ 0xfa, 0xde, 0x0c, 0x01 ][..]) >>
               length: be_u32 >>
               super_: super_blob!(input) >>
-              (Blob::Entitlements(Entitlements {
+              (Blob::Requirements(Requirements {
                   super_: super_,
                   bytes: input,
               }))
@@ -656,7 +664,7 @@ fn detached_signature(input: &[u8]) -> IResult<&[u8], Blob> {
 }
 
 named!(blob<&[u8], Blob>,
-       alt_complete!(requirement | entitlements | code_directory | entitlement | blob_wrapper | embedded_signature | detached_signature));
+       alt_complete!(requirement | requirements | code_directory | entitlement | blob_wrapper | embedded_signature | detached_signature));
 
 fn parse_blob(data: &[u8]) -> Result<Blob> {
     trace!("parse_blob {:?}, {} bytes", data.as_ptr(), data.len());
