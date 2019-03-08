@@ -7,7 +7,7 @@ use darwincodesign::SignatureValidity;
 
 fn main() {
     env_logger::init().unwrap();
-        let matches = App::new(env!("CARGO_PKG_NAME"))
+    let matches = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(SubCommand::with_name("print")
                     .about("print signature information")

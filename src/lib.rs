@@ -113,19 +113,26 @@ pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
             //TODO: calculate hashes for all special slots
             for (&slot, hash) in cd.special_hashes.iter() {
                 match slot {
-                    Slot::Requirements =>
-                match sig.requirements() {
-                Some(r) => {
-                    let calc_hash = do_hash(r.bytes, cd.hash_type);
-                    if *hash != calc_hash {
-                        return Ok(SignatureValidity::Invalid);
+                    Slot::Requirements => {
+                        debug!("Slot::Requirements");
+                        match sig.requirements() {
+                            Some(r) => {
+                                let calc_hash = do_hash(r.bytes, cd.hash_type);
+                                if *hash != calc_hash {
+                                    warn!("Requirements hash doesn't match: calculated {:?} expected {:?}", calc_hash, *hash);
+                                    return Ok(SignatureValidity::Invalid);
+                                }
+                            }
+                            None => {
+                                warn!("Missing requirements!");
+                                return Ok(SignatureValidity::Invalid);
+                            }
+                        }
+                    },
+                    _ => {
+                        warn!("Unhandled slot!");
+                        // TODO
                     }
-                }
-                None => {
-                    return Ok(SignatureValidity::Invalid);
-                }
-            },
-            _ => {} // TODO
                 }
             }
             let calc_hashes = code_hashes(data, cd.hash_type, cd.page_size, cd.code_limit);
@@ -133,6 +140,7 @@ pub fn verify_signature<P>(path: P) -> Result<SignatureValidity>
             if eq {
                 Ok(SignatureValidity::Valid)
             } else {
+                warn!("Code hashes don't match!");
                 Ok(SignatureValidity::Invalid)
             }
         } else {
